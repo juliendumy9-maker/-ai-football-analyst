@@ -1,0 +1,113 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-football}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+      POSTGRES_DB: ${POSTGRES_DB:-ai_football_analyst}
+    ports:
+      # Exposed for local dev convenience (psql/DB GUI from the host).
+      # Don't expose this port on a production deployment.
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-football}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: ./apps/api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: db
+      REDIS_HOST: redis
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./apps/api:/app
+    # entrypoint.sh applies migrations before uvicorn starts (Phase 2 —
+    # see its comments for the dev-vs-prod distinction). Only this service
+    # runs it; `scheduler` below deliberately does not, to avoid two
+    # containers racing to autogenerate/apply migrations at once.
+    entrypoint: ["./entrypoint.sh"]
+    # --reload is for local dev only; a production image should run
+    # plain `uvicorn app.main:app` (Render's start command does this).
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    healthcheck:
+      # No curl in the python:3.12-slim base image — use Python's own
+      # stdlib instead of adding a package just for the healthcheck.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # Runs the daily orchestrator on a schedule. Phase 1/this review: the
+  # scheduling skeleton (timezone, cron trigger, idempotency contract) is
+  # real; the orchestrator body it calls is Phase 5 work — see
+  # app/scheduler.py's docstring.
+  scheduler:
+    build:
+      context: ./apps/api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: db
+      REDIS_HOST: redis
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        # Waits for `api` to be healthy, not just started — since `api`
+        # is the one that runs migrations (via entrypoint.sh) and this
+        # service deliberately doesn't, this ordering is what actually
+        # guarantees the schema exists before the scheduler's future
+        # (Phase 5) DB access runs. Today's placeholder job doesn't touch
+        # the DB at all, so this only matters going forward.
+        condition: service_healthy
+    volumes:
+      - ./apps/api:/app
+    command: python -m app.scheduler
+
+volumes:
+  pgdata:
+
+  web:
+    build:
+      context: ./apps/web
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000/api/v1}
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000/api/v1}
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+
