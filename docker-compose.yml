@@ -97,7 +97,7 @@ services:
 volumes:
   pgdata:
 
-  web:
+web:
     build:
       context: ./apps/web
       args:
